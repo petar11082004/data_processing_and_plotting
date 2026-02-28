@@ -196,55 +196,56 @@ def find_equilibrium(points: Iterable[SurfacePoint]) -> SurfacePoint:
     return min(points, key=lambda p: p.energy_hartree)
 
 
-def _group_close(values: np.ndarray, tol: float) -> list[float]:
-    unique: list[float] = []
-    for v in sorted(float(x) for x in values):
-        if not unique or abs(v - unique[-1]) > tol:
-            unique.append(v)
-    return unique
+def _fit_local_quadratic(points: list[SurfacePoint], eq: SurfacePoint) -> tuple[float, float]:
+    """
+    Fit E(dr, dtheta) = c0 + c1*dr + c2*dtheta + c3*dr^2 + c4*dtheta^2 + c5*dr*dtheta
+    around the minimum and return (k_r, k_theta) where:
+      k_r = d2E/dr2  (Hartree / Angstrom^2)
+      k_theta = d2E/dtheta2 (Hartree / rad^2)
+    """
+    if len(points) < 20:
+        raise ValueError("Need at least 20 points to estimate frequencies robustly.")
 
-
-def _slice_indices(values: np.ndarray, target: float, tol: float) -> np.ndarray:
-    close = np.isclose(values, target, atol=tol, rtol=0.0)
-    return np.where(close)[0]
-
-
-def _fit_mode(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
-    if len(x) < 3:
-        raise ValueError("Need at least 3 points for quadratic fit.")
-    coeffs = np.polyfit(x, y, deg=2)
-    a, b, c = coeffs
-    if a <= 0:
-        raise ValueError("Non-positive curvature from quadratic fit.")
-    x0 = -b / (2 * a)
-    e0 = float(np.polyval(coeffs, x0))
-    k = 2 * a
-    return float(x0), e0, float(k)
-
-
-def _select_mode_cuts(points: list[SurfacePoint], eq: SurfacePoint) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     r = np.array([p.r_angstrom for p in points], dtype=float)
-    theta = np.array([p.theta_deg for p in points], dtype=float)
+    theta_rad = np.radians(np.array([p.theta_deg for p in points], dtype=float))
     e = np.array([p.energy_hartree for p in points], dtype=float)
 
-    theta_candidates = _group_close(theta, tol=1e-6)
-    theta_ref = min(theta_candidates, key=lambda t: abs(t - eq.theta_deg))
-    stretch_idx = _slice_indices(theta, theta_ref, tol=1e-6)
+    dr = r - eq.r_angstrom
+    dtheta = theta_rad - math.radians(eq.theta_deg)
 
-    r_candidates = _group_close(r, tol=1e-6)
-    r_ref = min(r_candidates, key=lambda rr: abs(rr - eq.r_angstrom))
-    bend_idx = _slice_indices(r, r_ref, tol=1e-6)
+    # Bias the fit toward points near equilibrium where harmonic approximation is valid.
+    dist = np.sqrt((dr / 0.06) ** 2 + (dtheta / 0.12) ** 2)
+    n_fit = min(len(points), max(120, len(points) // 8))
+    idx = np.argsort(dist)[:n_fit]
 
-    return r[stretch_idx], e[stretch_idx], theta[bend_idx], e[bend_idx]
+    drf = dr[idx]
+    dthf = dtheta[idx]
+    ef = e[idx]
+
+    x = np.column_stack(
+        [
+            np.ones_like(drf),
+            drf,
+            dthf,
+            drf * drf,
+            dthf * dthf,
+            drf * dthf,
+        ]
+    )
+    coeffs, *_ = np.linalg.lstsq(x, ef, rcond=None)
+    c3 = float(coeffs[3])
+    c4 = float(coeffs[4])
+
+    k_r = 2.0 * c3
+    k_theta = 2.0 * c4
+    if k_r <= 0.0 or k_theta <= 0.0:
+        raise ValueError("Failed to obtain positive harmonic curvatures near equilibrium.")
+    return k_r, k_theta
 
 
 def estimate_frequencies(points: list[SurfacePoint]) -> dict[str, float]:
     eq = find_equilibrium(points)
-    r_stretch, e_stretch, theta_bend_deg, e_bend = _select_mode_cuts(points, eq)
-
-    _, _, k_r_hartree_per_a2 = _fit_mode(r_stretch, e_stretch)
-    theta_bend_rad = np.radians(theta_bend_deg)
-    _, _, k_theta_hartree_per_rad2 = _fit_mode(theta_bend_rad, e_bend)
+    k_r_hartree_per_a2, k_theta_hartree_per_rad2 = _fit_local_quadratic(points, eq)
 
     k_r_si = k_r_hartree_per_a2 * HARTREE_TO_J / (ANGSTROM_TO_M**2)
     k_theta_si = k_theta_hartree_per_rad2 * HARTREE_TO_J
@@ -298,4 +299,3 @@ def analyze_surface(source: str, plot_path: str) -> dict[str, float]:
         "nu1_cm^-1": freqs["nu1_cm^-1"],
         "nu2_cm^-1": freqs["nu2_cm^-1"],
     }
-

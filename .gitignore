@@ -9,4 +9,5 @@ venv/
 build/
 dist/
 *.png
-
+part2programming/
+*.out
